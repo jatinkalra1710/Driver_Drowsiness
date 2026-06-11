@@ -155,7 +155,7 @@ div[data-testid="stToolbar"] { visibility:hidden; }
 # ─────────────────────────────────────────────────────────────
 # Constants — matched EXACTLY to your notebook
 # ─────────────────────────────────────────────────────────────
-MODEL_PATH  = "model/efficientnet_drowsiness.h5"
+MODEL_PATH  = "driver_drowsiness_model.h5"
 IMG_SIZE    = (224, 224)          # your notebook Cell 2
 CLASSES     = ["Drowsy", "Non Drowsy"]
 DROWSY_IDX  = 0                   # 'Drowsy' is index 0 alphabetically
