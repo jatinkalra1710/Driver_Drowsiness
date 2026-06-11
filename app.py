@@ -1,21 +1,20 @@
 """
-DrowsyGuard — Streamlit Frontend for EfficientNetB0 (WebRTC Version)
-===================================================================
+DrowsyGuard — Streamlit Frontend for EfficientNetB0 (Thread-Safe WebRTC Version)
+=============================================================================
 Perfectly matched to your notebook (mobnet.ipynb adapted to EfficientNetB0):
 
   ✅ Browser-based webcam streaming via streamlit-webrtc (Cloud Compatible)
+  ✅ Thread-Safe variable cross-bridging to prevent sudden camera timeouts
   ✅ IMG_SIZE = (224, 224), RGB
   ✅ preprocess_input is BAKED INSIDE the model — just pass raw 0-255 images
-  ✅ 2 classes: index 0 = Drowsy, index 1 = Non Drowsy  (alphabetical order)
-  ✅ Dense(2, softmax) output
+  ✅ 2 classes: index 0 = Drowsy, index 1 = Non Drowsy (alphabetical order)
   ✅ Temporal smoothing for stable realtime predictions
-  ✅ Rolling alert logic with cooldown to avoid false positives
 
 Run:
     pip install streamlit opencv-python-headless tensorflow numpy streamlit-webrtc av
     streamlit run app.py
 
-Place your model at:  model/efficientnet_drowsiness.h5
+Place your model at:  driver_drowsiness_model.h5
 """
 
 import streamlit as st
@@ -164,15 +163,15 @@ SMOOTH_WINDOW = 7                 # rolling average window for predictions
 CONF_THRESH  = 0.60               # minimum confidence to trust prediction
 
 # OpenCV face cascades
-FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
-EYE_CASCADE  = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_eye.xml"
-)
+@st.cache_resource
+def load_cascades():
+    face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    eye = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    return face, eye
 
-# STUN configuration to support WebRTC connections across networks (essential for Cloud deployments)
-# Expanded STUN list to handle tougher firewall handshakes
+FACE_CASCADE, EYE_CASCADE = load_cascades()
+
+# Expanded NAT Traversal config to bypass strict firewalls
 RTC_CONFIGURATION = RTCConfiguration(
     {
         "iceServers": [
@@ -183,6 +182,7 @@ RTC_CONFIGURATION = RTCConfiguration(
         ]
     }
 )
+
 # ─────────────────────────────────────────────────────────────
 # Session state
 # ─────────────────────────────────────────────────────────────
@@ -205,6 +205,20 @@ ss("pred_history",   collections.deque(maxlen=SMOOTH_WINDOW))
 ss("drowsy_streak",  0)
 ss("conf_history",   collections.deque(maxlen=40))
 
+# Thread-safe dictionary bridge to avoid write collisions across processing pools
+if "thread_bridge" not in st.session_state:
+    st.session_state["thread_bridge"] = {
+        "alert": False,
+        "alert_msg": "",
+        "state_label": "—",
+        "confidence": 0.0,
+        "fps": 0,
+        "frame_count": 0,
+        "alert_count": 0,
+        "drowsy_streak": 0,
+        "conf_history_list": []
+    }
+
 # ─────────────────────────────────────────────────────────────
 # Model loader
 # ─────────────────────────────────────────────────────────────
@@ -214,7 +228,6 @@ def load_effnet():
     if TF_OK:
         try:
             st.session_state["model"] = load_model(MODEL_PATH)
-            # Warm up the model with a dummy pass
             dummy = np.zeros((1, *IMG_SIZE, 3), dtype="float32")
             st.session_state["model"].predict(dummy, verbose=0)
             st.session_state["model_loaded"] = True
@@ -234,7 +247,6 @@ def log_event(msg, kind="ok"):
     if len(st.session_state["event_log"]) > 30:
         st.session_state["event_log"].pop()
 
-# Load model instantly on setup script execution
 load_effnet()
 
 # ─────────────────────────────────────────────────────────────
@@ -242,14 +254,12 @@ load_effnet()
 # ─────────────────────────────────────────────────────────────
 def predict_frame(frame_rgb):
     model = st.session_state["model"]
-
-    img = cv2.resize(frame_rgb, IMG_SIZE).astype("float32")  # 0-255 float32
-    inp = np.expand_dims(img, axis=0)                         # (1,224,224,3)
+    img = cv2.resize(frame_rgb, IMG_SIZE).astype("float32")  
+    inp = np.expand_dims(img, axis=0)                         
 
     if model is not None:
-        probs = model.predict(inp, verbose=0)[0]              # [p_drowsy, p_awake]
+        probs = model.predict(inp, verbose=0)[0]              
     else:
-        # Demo context: simulate cyclical state tracking
         t = time.time()
         p_drowsy = 0.85 if int(t) % 8 < 2 else 0.08
         probs = np.array([p_drowsy, 1 - p_drowsy])
@@ -262,9 +272,7 @@ def smooth_prediction(probs):
     return history.mean(axis=0)
 
 def annotate_frame(frame_bgr, label, confidence, alert, current_fps):
-    """Draw detection overlay on the frame."""
     h, w = frame_bgr.shape[:2]
-
     gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
 
@@ -297,58 +305,55 @@ def annotate_frame(frame_bgr, label, confidence, alert, current_fps):
 # WebRTC Audio/Video Frame Processor Callback
 # ─────────────────────────────────────────────────────────────
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
-    # Convert incoming browser video package to raw BGR for OpenCV matching your logic
     img_bgr = frame.to_ndarray(format="bgr24")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     
     t0 = time.time()
-    if st.session_state["start_time"] is None:
-        st.session_state["start_time"] = t0
+    bridge = st.session_state["thread_bridge"]
 
-    # ── Inference Execution ──
+    # Inference Calculation Pipeline
     raw_probs = predict_frame(img_rgb)
     smooth_probs = smooth_prediction(raw_probs)
-
     drowsy_conf = float(smooth_probs[DROWSY_IDX])
 
-    # Dynamic Threshold filtering
-    if max(smooth_probs) >= st.session_state["conf_thresh_val"]:
+    if max(smooth_probs) >= st.session_state.get("conf_thresh_val", 0.60):
         pred_idx = int(np.argmax(smooth_probs))
         label = CLASSES[pred_idx]
         conf = float(smooth_probs[pred_idx])
     else:
-        label = st.session_state["state_label"] if st.session_state["state_label"] != "—" else "Non Drowsy"
+        label = bridge["state_label"] if bridge["state_label"] != "—" else "Non Drowsy"
         conf = max(smooth_probs)
 
-    # ── Sequential Streak Analysis Logic ──
+    # Isolated Streak Increments
     if label == "Drowsy":
-        st.session_state["drowsy_streak"] += 1
+        bridge["drowsy_streak"] += 1
     else:
-        st.session_state["drowsy_streak"] = max(0, st.session_state["drowsy_streak"] - 1)
+        bridge["drowsy_streak"] = max(0, bridge["drowsy_streak"] - 1)
 
-    was_alert = st.session_state["alert"]
-    alert = st.session_state["drowsy_streak"] >= st.session_state["alert_frames_val"]
+    was_alert = bridge["alert"]
+    alert = bridge["drowsy_streak"] >= st.session_state.get("alert_frames_val", 12)
 
     if alert and not was_alert:
-        st.session_state["alert_count"] += 1
-        st.session_state["alert_msg"] = f"🚨 DROWSINESS DETECTED — confidence {drowsy_conf:.0%}"
-        log_event(f"ALERT: drowsy for {st.session_state['alert_frames_val']} frames ({drowsy_conf:.0%} conf)", "alert")
+        bridge["alert_count"] += 1
+        bridge["alert_msg"] = f"🚨 DROWSINESS DETECTED — confidence {drowsy_conf:.0%}"
     elif not alert and was_alert:
-        st.session_state["alert_msg"] = ""
-        log_event("Alert cleared — driver alert", "ok")
+        bridge["alert_msg"] = ""
 
-    # Update global metric references safely from back-thread wrapper
     current_fps = max(1, int(1.0 / max(time.time() - t0, 0.001)))
-    st.session_state["alert"] = alert
-    st.session_state["state_label"] = label
-    st.session_state["confidence"] = conf
-    st.session_state["fps"] = current_fps
-    st.session_state["frame_count"] += 1
-    st.session_state["conf_history"].append((conf, label))
-
-    # Compile annotations directly back to output pipeline arrays
-    annotated_bgr = annotate_frame(img_bgr, label, conf, alert, current_fps)
     
+    # Store parameters inside the safe dictionary structure
+    bridge["alert"] = alert
+    bridge["state_label"] = label
+    bridge["confidence"] = conf
+    bridge["fps"] = current_fps
+    bridge["frame_count"] += 1
+    
+    bridge["conf_history_list"].append((conf, label))
+    if len(bridge["conf_history_list"]) > 40:
+        bridge["conf_history_list"].pop(0)
+
+    # Render frame array updates
+    annotated_bgr = annotate_frame(img_bgr, label, conf, alert, current_fps)
     return av.VideoFrame.from_ndarray(annotated_bgr, format="bgr24")
 
 # ─────────────────────────────────────────────────────────────
@@ -358,7 +363,6 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     model_path_input = st.text_input("Model .h5 path", value=MODEL_PATH)
     
-    # Sliders directly write to explicit state bindings referenced in callbacks
     alert_frames = st.slider("Alert sensitivity (frames)", 5, 30, ALERT_FRAMES,
                              help="Lower = more sensitive. At ~15 fps, 12 frames ≈ 0.8s")
     conf_thresh = st.slider("Min confidence threshold", 0.5, 0.95, CONF_THRESH, 0.05,
@@ -387,7 +391,7 @@ with st.sidebar:
     st.caption("⚠️ For demo purposes only. Not a safety-critical system.")
 
 # ─────────────────────────────────────────────────────────────
-# Page header HTML Layout
+# Page header Layout
 # ─────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="dg-header">
@@ -401,34 +405,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# Structural Multi-Column Layout
+# Structural Layout
 # ─────────────────────────────────────────────────────────────
 col_cam, col_panel = st.columns([5, 3], gap="large")
 
 with col_cam:
     banner_ph = st.empty()
     
-    # ── Integrated WebRTC Streamer Window Element ──
     ctx = webrtc_streamer(
         key="drowsy-guard-streamer",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTC_CONFIGURATION,
         video_frame_callback=video_frame_callback,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
         async_processing=True,
     )
     
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     
-    # State reset context management rules checking live updates
     if ctx.state.playing:
         if st.session_state["start_time"] is None:
             st.session_state["start_time"] = time.time()
     else:
         st.session_state["start_time"] = None
-        st.session_state["alert"] = False
-        st.session_state["state_label"] = "—"
-        st.session_state["confidence"] = 0.0
+        st.session_state["thread_bridge"]["alert"] = False
+        st.session_state["thread_bridge"]["state_label"] = "—"
+        st.session_state["thread_bridge"]["confidence"] = 0.0
 
 with col_panel:
     st.markdown('<p style="font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px">Detection Status</p>', unsafe_allow_html=True)
@@ -451,12 +453,14 @@ with col_panel:
     log_ph = st.empty()
 
 # ─────────────────────────────────────────────────────────────
-# Dynamic Component Panel Update Processing Loops
+# Dynamic Component Panel Sync Management
 # ─────────────────────────────────────────────────────────────
 def render_panel_ui():
-    label = st.session_state["state_label"]
-    conf  = st.session_state["confidence"]
-    alert = st.session_state["alert"]
+    bridge = st.session_state["thread_bridge"]
+    
+    label = bridge["state_label"]
+    conf  = bridge["confidence"]
+    alert = bridge["alert"]
 
     pill_cls = "pill-alert" if label == "Drowsy" else ("pill-ok" if label == "Non Drowsy" else "pill-wait")
     conf_pct = int(conf * 100)
@@ -476,9 +480,9 @@ def render_panel_ui():
       </div>
     </div>""", unsafe_allow_html=True)
 
-    fps_ph.metric("FPS",    st.session_state["fps"])
-    alerts_ph.metric("Alerts", st.session_state["alert_count"])
-    frames_ph.metric("Frames", st.session_state["frame_count"])
+    fps_ph.metric("FPS",    bridge["fps"])
+    alerts_ph.metric("Alerts", bridge["alert_count"])
+    frames_ph.metric("Frames", bridge["frame_count"])
 
     if st.session_state["start_time"]:
         s = int(time.time() - st.session_state["start_time"])
@@ -486,35 +490,39 @@ def render_panel_ui():
     else:
         uptime_ph.metric("Uptime", "—")
 
-    # Banner generation checks
+    # Banner updates linked to bridge changes
     if ctx.state.playing:
         if alert:
-            banner_ph.markdown(f'<div class="alert-banner">{st.session_state["alert_msg"]}</div>', unsafe_allow_html=True)
+            banner_ph.markdown(f'<div class="alert-banner">{bridge["alert_msg"]}</div>', unsafe_allow_html=True)
+            # Sync logs safely on new alert event matching criteria
+            if len(st.session_state["event_log"]) == 0 or "ALERT" not in st.session_state["event_log"][0][1]:
+                log_event(f"ALERT: Drowsiness threshold hit!", "alert")
         else:
             banner_ph.markdown(f'<div class="ok-banner">✅ &nbsp; Driver Alert &nbsp;·&nbsp; {label} &nbsp;({conf:.0%})</div>', unsafe_allow_html=True)
     else:
         banner_ph.markdown('<div class="ok-banner" style="background:#1e2535;color:#64748b;border-color:#334155">📷 Camera Stopped. Click "Start" above to stream window.</div>', unsafe_allow_html=True)
 
-    # Sparkline chart array updates
-    history = list(st.session_state["conf_history"])
+    # Sparkline chart rendering
+    history = bridge["conf_history_list"]
     if history:
         bars_html = ""
-        for i, (c, lbl) in enumerate(history):
+        for (c, lbl) in history:
             ht  = max(4, int(c * 48))
             clr = "#ef4444" if lbl == "Drowsy" else "#22c55e"
             bars_html += f'<div class="hist-bar" style="height:{ht}px;background:{clr}"></div>'
         hist_ph.markdown(f'<div class="hist-wrap">{bars_html}</div>', unsafe_allow_html=True)
 
-    # Event log rendering
+    # Event log loops
     log_html = ""
     for ts, msg, kind in st.session_state["event_log"][:10]:
         cls = {"ok": "lo", "warn": "lw", "alert": "la"}.get(kind, "lo")
         log_html += f'<div class="logline"><span class="lt">{ts}</span><span class="{cls}">{msg}</span></div>'
     log_ph.markdown(log_html or '<div class="logline"><span class="lt">—</span><span class="lo">Waiting…</span></div>', unsafe_allow_html=True)
 
-# Continuous auto-refresh trigger to paint the frame analytics while WebRTC thread processes frames
+# Paint metric changes dynamically onto the dashboard
+render_panel_ui()
+
+# Fast reactive interface refresh when the connection pipeline is active
 if ctx.state.playing:
-    time.sleep(0.1)
+    time.sleep(0.05)
     st.rerun()
-else:
-    render_panel_ui()
