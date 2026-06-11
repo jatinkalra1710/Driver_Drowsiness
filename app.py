@@ -1,20 +1,13 @@
 """
-DrowsyGuard — Streamlit Frontend for EfficientNetB0 (Thread-Safe WebRTC Version)
-=============================================================================
+DrowsyGuard — Streamlit Frontend for EfficientNetB0 (Cloud Native WebRTC)
+======================================================================
 Perfectly matched to your notebook (mobnet.ipynb adapted to EfficientNetB0):
 
-  ✅ Browser-based webcam streaming via streamlit-webrtc (Cloud Compatible)
-  ✅ Thread-Safe variable cross-bridging to prevent sudden camera timeouts
+  ✅ Cloud-safe architecture using global registries instead of thread session state
   ✅ IMG_SIZE = (224, 224), RGB
   ✅ preprocess_input is BAKED INSIDE the model — just pass raw 0-255 images
   ✅ 2 classes: index 0 = Drowsy, index 1 = Non Drowsy (alphabetical order)
   ✅ Temporal smoothing for stable realtime predictions
-
-Run:
-    pip install streamlit opencv-python-headless tensorflow numpy streamlit-webrtc av
-    streamlit run app.py
-
-Place your model at:  driver_drowsiness_model.h5
 """
 
 import streamlit as st
@@ -152,17 +145,16 @@ div[data-testid="stToolbar"] { visibility:hidden; }
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# Constants — matched EXACTLY to your notebook
+# Constants & Shared Resources
 # ─────────────────────────────────────────────────────────────
 MODEL_PATH  = "driver_drowsiness_model.h5"
-IMG_SIZE    = (224, 224)          # your notebook Cell 2
+IMG_SIZE    = (224, 224)
 CLASSES     = ["Drowsy", "Non Drowsy"]
-DROWSY_IDX  = 0                   # 'Drowsy' is index 0 alphabetically
-ALERT_FRAMES = 12                 # consecutive drowsy frames before alert
-SMOOTH_WINDOW = 7                 # rolling average window for predictions
-CONF_THRESH  = 0.60               # minimum confidence to trust prediction
+DROWSY_IDX  = 0
+ALERT_FRAMES_DEFAULT = 12
+SMOOTH_WINDOW_DEFAULT = 7
+CONF_THRESH_DEFAULT = 0.60
 
-# OpenCV face cascades
 @st.cache_resource
 def load_cascades():
     face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -171,135 +163,67 @@ def load_cascades():
 
 FACE_CASCADE, EYE_CASCADE = load_cascades()
 
-# Expanded NAT Traversal config to bypass strict firewalls
-RTC_CONFIGURATION = RTCConfiguration(
-    {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
-            {"urls": ["stun:stun2.l.google.com:19302", "stun:stun3.l.google.com:19302"]},
-            {"urls": ["stun:stun.ekiga.net"]},
-            {"urls": ["stun:stun.ideasip.com"]}
-        ]
-    }
-)
+@st.cache_resource
+def load_cached_model():
+    if TF_OK:
+        try:
+            model = load_model(MODEL_PATH)
+            dummy = np.zeros((1, *IMG_SIZE, 3), dtype="float32")
+            model.predict(dummy, verbose=0)
+            return model
+        except Exception:
+            return None
+    return None
+
+SHARED_MODEL = load_cached_model()
 
 # ─────────────────────────────────────────────────────────────
-# Session state
+# Global State Bridge Object (Bypasses Session State Limitations)
+# ─────────────────────────────────────────────────────────────
+class WebRTCStateStateBridge:
+    def __init__(self):
+        self.state_label = "—"
+        self.confidence = 0.0
+        self.fps = 0
+        self.frame_count = 0
+        self.alert_count = 0
+        self.drowsy_streak = 0
+        self.alert = False
+        self.alert_msg = ""
+        self.conf_history_list = []
+        self.pred_history = collections.deque(maxlen=SMOOTH_WINDOW_DEFAULT)
+        # Parameters updated from main thread sliders
+        self.alert_frames_val = ALERT_FRAMES_DEFAULT
+        self.conf_thresh_val = CONF_THRESH_DEFAULT
+
+@st.cache_resource
+def get_state_bridge():
+    return WebRTCStateStateBridge()
+
+BRIDGE = get_state_bridge()
+
+# ─────────────────────────────────────────────────────────────
+# Session state initialization (UI Only)
 # ─────────────────────────────────────────────────────────────
 def ss(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
-ss("model",          None)
-ss("model_loaded",   False)
-ss("alert",          False)
-ss("alert_msg",      "")
-ss("state_label",    "—")
-ss("confidence",     0.0)
-ss("fps",            0)
-ss("alert_count",    0)
-ss("frame_count",    0)
-ss("start_time",     None)
-ss("event_log",      [])
-ss("pred_history",   collections.deque(maxlen=SMOOTH_WINDOW))
-ss("drowsy_streak",  0)
-ss("conf_history",   collections.deque(maxlen=40))
-
-# Thread-safe dictionary bridge to avoid write collisions across processing pools
-if "thread_bridge" not in st.session_state:
-    st.session_state["thread_bridge"] = {
-        "alert": False,
-        "alert_msg": "",
-        "state_label": "—",
-        "confidence": 0.0,
-        "fps": 0,
-        "frame_count": 0,
-        "alert_count": 0,
-        "drowsy_streak": 0,
-        "conf_history_list": []
-    }
-
-# ─────────────────────────────────────────────────────────────
-# Model loader
-# ─────────────────────────────────────────────────────────────
-def load_effnet():
-    if st.session_state["model_loaded"]:
-        return
-    if TF_OK:
-        try:
-            st.session_state["model"] = load_model(MODEL_PATH)
-            dummy = np.zeros((1, *IMG_SIZE, 3), dtype="float32")
-            st.session_state["model"].predict(dummy, verbose=0)
-            st.session_state["model_loaded"] = True
-            log_event("EfficientNetB0 model loaded ✓", "ok")
-        except Exception as e:
-            log_event(f"Model load failed: {e} — demo mode", "warn")
-            st.session_state["model_loaded"] = True
-    else:
-        log_event("TensorFlow not installed — demo mode active", "warn")
-        st.session_state["model_loaded"] = True
+ss("start_time", None)
+ss("event_log",  [])
 
 def log_event(msg, kind="ok"):
     ts = datetime.now().strftime("%H:%M:%S")
-    if "event_log" not in st.session_state:
-        st.session_state["event_log"] = []
     st.session_state["event_log"].insert(0, (ts, msg, kind))
     if len(st.session_state["event_log"]) > 30:
         st.session_state["event_log"].pop()
 
-load_effnet()
-
-# ─────────────────────────────────────────────────────────────
-# Inference & Logic Framework
-# ─────────────────────────────────────────────────────────────
-def predict_frame(frame_rgb):
-    model = st.session_state["model"]
-    img = cv2.resize(frame_rgb, IMG_SIZE).astype("float32")  
-    inp = np.expand_dims(img, axis=0)                         
-
-    if model is not None:
-        probs = model.predict(inp, verbose=0)[0]              
+# Initial log load alert
+if not st.session_state["event_log"]:
+    if SHARED_MODEL is not None:
+        log_event("EfficientNetB0 model loaded ✓", "ok")
     else:
-        t = time.time()
-        p_drowsy = 0.85 if int(t) % 8 < 2 else 0.08
-        probs = np.array([p_drowsy, 1 - p_drowsy])
-
-    return probs
-
-def smooth_prediction(probs):
-    st.session_state["pred_history"].append(probs)
-    history = np.array(st.session_state["pred_history"])
-    return history.mean(axis=0)
-
-def annotate_frame(frame_bgr, label, confidence, alert, current_fps):
-    h, w = frame_bgr.shape[:2]
-    gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
-
-    color = (60, 80, 255) if label == "Drowsy" else (60, 220, 100)
-
-    for (fx, fy, fw, fh) in faces:
-        cv2.rectangle(frame_bgr, (fx, fy), (fx+fw, fy+fh), color, 2)
-        label_text = f"{label}  {confidence:.0%}"
-        (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(frame_bgr, (fx, fy-th-14), (fx+tw+10, fy), color, -1)
-        cv2.putText(frame_bgr, label_text, (fx+5, fy-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-
-        eye_roi = gray[fy:fy+int(fh*0.6), fx:fx+fw]
-        eyes = EYE_CASCADE.detectMultiScale(eye_roi, 1.1, 3)
-        for (ex, ey, ew, eh) in eyes[:2]:
-            cv2.rectangle(frame_bgr, (fx+ex, fy+ey), (fx+ex+ew, fy+ey+eh), (255, 200, 60), 1)
-        break
-
-    if alert:
-        cv2.rectangle(frame_bgr, (0, 0), (w-1, h-1), (0, 0, 255), 8)
-        cv2.putText(frame_bgr, "! DROWSINESS ALERT !", (w//2 - 160, h-16), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 255), 2)
-
-    hud_col = (60, 80, 255) if alert else (60, 220, 100)
-    cv2.putText(frame_bgr, "DROWSYGUARD", (12, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, hud_col, 2)
-    cv2.putText(frame_bgr, f"FPS {current_fps}", (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160,160,160), 1)
-
-    return frame_bgr
+        log_event("Model file missing or TF not installed — demo mode active", "warn")
 
 # ─────────────────────────────────────────────────────────────
 # WebRTC Audio/Video Frame Processor Callback
@@ -309,72 +233,110 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     
     t0 = time.time()
-    bridge = st.session_state["thread_bridge"]
 
-    # Inference Calculation Pipeline
-    raw_probs = predict_frame(img_rgb)
-    smooth_probs = smooth_prediction(raw_probs)
+    # ── Inference Calculation Pipeline ──
+    img = cv2.resize(img_rgb, IMG_SIZE).astype("float32")  
+    inp = np.expand_dims(img, axis=0)                         
+
+    if SHARED_MODEL is not None:
+        probs = SHARED_MODEL.predict(inp, verbose=0)[0]              
+    else:
+        # Simulation loop fallback
+        t = time.time()
+        p_drowsy = 0.85 if int(t) % 8 < 2 else 0.08
+        probs = np.array([p_drowsy, 1 - p_drowsy])
+
+    # Temporal Smoothing
+    BRIDGE.pred_history.append(probs)
+    smooth_probs = np.array(BRIDGE.pred_history).mean(axis=0)
     drowsy_conf = float(smooth_probs[DROWSY_IDX])
 
-    if max(smooth_probs) >= st.session_state.get("conf_thresh_val", 0.60):
+    # Threshold Check
+    if max(smooth_probs) >= BRIDGE.conf_thresh_val:
         pred_idx = int(np.argmax(smooth_probs))
         label = CLASSES[pred_idx]
         conf = float(smooth_probs[pred_idx])
     else:
-        label = bridge["state_label"] if bridge["state_label"] != "—" else "Non Drowsy"
+        label = BRIDGE.state_label if BRIDGE.state_label != "—" else "Non Drowsy"
         conf = max(smooth_probs)
 
-    # Isolated Streak Increments
+    # Streak Handling
     if label == "Drowsy":
-        bridge["drowsy_streak"] += 1
+        BRIDGE.drowsy_streak += 1
     else:
-        bridge["drowsy_streak"] = max(0, bridge["drowsy_streak"] - 1)
+        BRIDGE.drowsy_streak = max(0, BRIDGE.drowsy_streak - 1)
 
-    was_alert = bridge["alert"]
-    alert = bridge["drowsy_streak"] >= st.session_state.get("alert_frames_val", 12)
+    was_alert = BRIDGE.alert
+    alert = BRIDGE.drowsy_streak >= BRIDGE.alert_frames_val
 
     if alert and not was_alert:
-        bridge["alert_count"] += 1
-        bridge["alert_msg"] = f"🚨 DROWSINESS DETECTED — confidence {drowsy_conf:.0%}"
+        BRIDGE.alert_count += 1
+        BRIDGE.alert_msg = f"🚨 DROWSINESS DETECTED — confidence {drowsy_conf:.0%}"
     elif not alert and was_alert:
-        bridge["alert_msg"] = ""
+        BRIDGE.alert_msg = ""
 
     current_fps = max(1, int(1.0 / max(time.time() - t0, 0.001)))
     
-    # Store parameters inside the safe dictionary structure
-    bridge["alert"] = alert
-    bridge["state_label"] = label
-    bridge["confidence"] = conf
-    bridge["fps"] = current_fps
-    bridge["frame_count"] += 1
+    # Save parameters to global bridge securely
+    BRIDGE.alert = alert
+    BRIDGE.state_label = label
+    BRIDGE.confidence = conf
+    BRIDGE.fps = current_fps
+    BRIDGE.frame_count += 1
     
-    bridge["conf_history_list"].append((conf, label))
-    if len(bridge["conf_history_list"]) > 40:
-        bridge["conf_history_list"].pop(0)
+    BRIDGE.conf_history_list.append((conf, label))
+    if len(BRIDGE.conf_history_list) > 40:
+        BRIDGE.conf_history_list.pop(0)
 
-    # Render frame array updates
-    annotated_bgr = annotate_frame(img_bgr, label, conf, alert, current_fps)
-    return av.VideoFrame.from_ndarray(annotated_bgr, format="bgr24")
+    # Annotate Frame Matrix
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
+    color = (60, 80, 255) if label == "Drowsy" else (60, 220, 100)
+
+    for (fx, fy, fw, fh) in faces:
+        cv2.rectangle(img_bgr, (fx, fy), (fx+fw, fy+fh), color, 2)
+        label_text = f"{label}  {conf:.0%}"
+        (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(img_bgr, (fx, fy-th-14), (fx+tw+10, fy), color, -1)
+        cv2.putText(img_bgr, label_text, (fx+5, fy-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        eye_roi = gray[fy:fy+int(fh*0.6), fx:fx+fw]
+        eyes = EYE_CASCADE.detectMultiScale(eye_roi, 1.1, 3)
+        for (ex, ey, ew, eh) in eyes[:2]:
+            cv2.rectangle(img_bgr, (fx+ex, fy+ey), (fx+ex+ew, fy+ey+eh), (255, 200, 60), 1)
+        break
+
+    if alert:
+        cv2.rectangle(img_bgr, (0, 0), (w-1, h-1), (0, 0, 255), 8)
+        cv2.putText(img_bgr, "! DROWSINESS ALERT !", (w//2 - 160, h-16), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 255), 2)
+
+    hud_col = (60, 80, 255) if alert else (60, 220, 100)
+    cv2.putText(img_bgr, "DROWSYGUARD", (12, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, hud_col, 2)
+    cv2.putText(img_bgr, f"FPS {current_fps}", (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160,160,160), 1)
+
+    return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
 
 # ─────────────────────────────────────────────────────────────
 # Sidebar Configurations
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
-    model_path_input = st.text_input("Model .h5 path", value=MODEL_PATH)
+    st.text_input("Model .h5 path", value=MODEL_PATH, disabled=True)
     
-    alert_frames = st.slider("Alert sensitivity (frames)", 5, 30, ALERT_FRAMES,
+    alert_frames = st.slider("Alert sensitivity (frames)", 5, 30, ALERT_FRAMES_DEFAULT,
                              help="Lower = more sensitive. At ~15 fps, 12 frames ≈ 0.8s")
-    conf_thresh = st.slider("Min confidence threshold", 0.5, 0.95, CONF_THRESH, 0.05,
+    conf_thresh = st.slider("Min confidence threshold", 0.5, 0.95, CONF_THRESH_DEFAULT, 0.05,
                              help="Predictions below this are ignored")
-    smooth_win = st.slider("Temporal smoothing window", 1, 15, SMOOTH_WINDOW,
+    smooth_win = st.slider("Temporal smoothing window", 1, 15, SMOOTH_WINDOW_DEFAULT,
                             help="Average N frames — reduces jitter")
 
-    st.session_state["alert_frames_val"] = alert_frames
-    st.session_state["conf_thresh_val"] = conf_thresh
+    # Pass slider parameters directly to the bridge object
+    BRIDGE.alert_frames_val = alert_frames
+    BRIDGE.conf_thresh_val = conf_thresh
     
-    if len(st.session_state["pred_history"]) != smooth_win:
-        st.session_state["pred_history"] = collections.deque(maxlen=smooth_win)
+    if BRIDGE.pred_history.maxlen != smooth_win:
+        BRIDGE.pred_history = collections.deque(maxlen=smooth_win)
 
     st.divider()
     st.markdown("### 🧠 Model Info")
@@ -391,7 +353,7 @@ with st.sidebar:
     st.caption("⚠️ For demo purposes only. Not a safety-critical system.")
 
 # ─────────────────────────────────────────────────────────────
-# Page header Layout
+# Page header HTML Layout
 # ─────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="dg-header">
@@ -412,6 +374,11 @@ col_cam, col_panel = st.columns([5, 3], gap="large")
 with col_cam:
     banner_ph = st.empty()
     
+    # Expanded fallback array for multi-browser cloud deployment handshakes
+    RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]}
+    )
+
     ctx = webrtc_streamer(
         key="drowsy-guard-streamer",
         mode=WebRtcMode.SENDRECV,
@@ -428,9 +395,6 @@ with col_cam:
             st.session_state["start_time"] = time.time()
     else:
         st.session_state["start_time"] = None
-        st.session_state["thread_bridge"]["alert"] = False
-        st.session_state["thread_bridge"]["state_label"] = "—"
-        st.session_state["thread_bridge"]["confidence"] = 0.0
 
 with col_panel:
     st.markdown('<p style="font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px">Detection Status</p>', unsafe_allow_html=True)
@@ -453,14 +417,12 @@ with col_panel:
     log_ph = st.empty()
 
 # ─────────────────────────────────────────────────────────────
-# Dynamic Component Panel Sync Management
+# Dashboard UI Engine
 # ─────────────────────────────────────────────────────────────
 def render_panel_ui():
-    bridge = st.session_state["thread_bridge"]
-    
-    label = bridge["state_label"]
-    conf  = bridge["confidence"]
-    alert = bridge["alert"]
+    label = BRIDGE.state_label
+    conf  = BRIDGE.confidence
+    alert = BRIDGE.alert
 
     pill_cls = "pill-alert" if label == "Drowsy" else ("pill-ok" if label == "Non Drowsy" else "pill-wait")
     conf_pct = int(conf * 100)
@@ -468,7 +430,7 @@ def render_panel_ui():
 
     state_ph.markdown(f"""
     <div style="margin-bottom:6px">
-      <span class="pill {pill_cls}">{label if label != '—' else '— waiting —'}</span>
+      <span class="pill {pill_cls}">{label if ctx.state.playing else '— waiting —'}</span>
     </div>""", unsafe_allow_html=True)
 
     conf_ph.markdown(f"""
@@ -480,49 +442,51 @@ def render_panel_ui():
       </div>
     </div>""", unsafe_allow_html=True)
 
-    fps_ph.metric("FPS",    bridge["fps"])
-    alerts_ph.metric("Alerts", bridge["alert_count"])
-    frames_ph.metric("Frames", bridge["frame_count"])
+    fps_ph.metric("FPS",    BRIDGE.fps if ctx.state.playing else 0)
+    alerts_ph.metric("Alerts", BRIDGE.alert_count)
+    frames_ph.metric("Frames", BRIDGE.frame_count)
 
-    if st.session_state["start_time"]:
+    if st.session_state["start_time"] and ctx.state.playing:
         s = int(time.time() - st.session_state["start_time"])
         uptime_ph.metric("Uptime", f"{s//60:02d}:{s%60:02d}")
     else:
         uptime_ph.metric("Uptime", "—")
 
-    # Banner updates linked to bridge changes
+    # Banner updates
     if ctx.state.playing:
         if alert:
-            banner_ph.markdown(f'<div class="alert-banner">{bridge["alert_msg"]}</div>', unsafe_allow_html=True)
-            # Sync logs safely on new alert event matching criteria
-            if len(st.session_state["event_log"]) == 0 or "ALERT" not in st.session_state["event_log"][0][1]:
-                log_event(f"ALERT: Drowsiness threshold hit!", "alert")
+            banner_ph.markdown(f'<div class="alert-banner">{BRIDGE.alert_msg}</div>', unsafe_allow_html=True)
+            if len(st.session_state["event_log"]) == 0 or "🚨" not in st.session_state["event_log"][0][1]:
+                log_event(f"🚨 ALERT Triggered: Driver state indicates extreme drowsiness", "alert")
         else:
             banner_ph.markdown(f'<div class="ok-banner">✅ &nbsp; Driver Alert &nbsp;·&nbsp; {label} &nbsp;({conf:.0%})</div>', unsafe_allow_html=True)
+            if label == "Non Drowsy" and len(st.session_state["event_log"]) > 0 and "🚨" in st.session_state["event_log"][0][1]:
+                log_event("Driver alert state recovered", "ok")
     else:
-        banner_ph.markdown('<div class="ok-banner" style="background:#1e2535;color:#64748b;border-color:#334155">📷 Camera Stopped. Click "Start" above to stream window.</div>', unsafe_allow_html=True)
+        banner_ph.markdown('<div class="ok-banner" style="background:#1e2535;color:#64748b;border-color:#334155">📷 Camera Stopped. Click "Start" above to activate monitoring stream.</div>', unsafe_allow_html=True)
 
-    # Sparkline chart rendering
-    history = bridge["conf_history_list"]
-    if history:
+    # Sparkline charts
+    history = BRIDGE.conf_history_list
+    if history and ctx.state.playing:
         bars_html = ""
         for (c, lbl) in history:
             ht  = max(4, int(c * 48))
             clr = "#ef4444" if lbl == "Drowsy" else "#22c55e"
             bars_html += f'<div class="hist-bar" style="height:{ht}px;background:{clr}"></div>'
         hist_ph.markdown(f'<div class="hist-wrap">{bars_html}</div>', unsafe_allow_html=True)
+    else:
+        hist_ph.markdown('<div class="hist-wrap" style="justify-content:center;align-items:center;color:#475569;font-size:0.75rem;">No active data stream</div>', unsafe_allow_html=True)
 
-    # Event log loops
+    # Logs
     log_html = ""
     for ts, msg, kind in st.session_state["event_log"][:10]:
         cls = {"ok": "lo", "warn": "lw", "alert": "la"}.get(kind, "lo")
         log_html += f'<div class="logline"><span class="lt">{ts}</span><span class="{cls}">{msg}</span></div>'
     log_ph.markdown(log_html or '<div class="logline"><span class="lt">—</span><span class="lo">Waiting…</span></div>', unsafe_allow_html=True)
 
-# Paint metric changes dynamically onto the dashboard
 render_panel_ui()
 
-# Fast reactive interface refresh when the connection pipeline is active
+# Trigger script re-runs only when actively processing webcam feeds
 if ctx.state.playing:
     time.sleep(0.05)
     st.rerun()
