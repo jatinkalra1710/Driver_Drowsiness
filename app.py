@@ -1,13 +1,13 @@
 """
-DrowsyGuard — Streamlit Frontend for EfficientNetB0 (Cloud Native WebRTC)
-======================================================================
+DrowsyGuard — Streamlit Frontend for EfficientNetB0 (Production WebRTC Version)
+=============================================================================
 Perfectly matched to your notebook (mobnet.ipynb adapted to EfficientNetB0):
 
+  ✅ No st.rerun() loops — completely eliminates the AttributeError polling crash
   ✅ Native Thread-Safe Variable locks to prevent Streamlit Cloud KeyErrors
   ✅ IMG_SIZE = (224, 224), RGB
   ✅ preprocess_input is BAKED INSIDE the model — just pass raw 0-255 images
   ✅ 2 classes: index 0 = Drowsy, index 1 = Non Drowsy (alphabetical order)
-  ✅ Temporal smoothing for stable realtime predictions
 """
 
 import streamlit as st
@@ -179,7 +179,7 @@ def load_cached_model():
 SHARED_MODEL = load_cached_model()
 
 # ─────────────────────────────────────────────────────────────
-# Global Thread-Safe Memory Manager Object (Bypasses SessionState completely)
+# Global Thread-Safe Memory Manager Object
 # ─────────────────────────────────────────────────────────────
 class SystemMetricsBridge:
     def __init__(self):
@@ -194,7 +194,6 @@ class SystemMetricsBridge:
         self.alert_msg = ""
         self.conf_history_list = []
         self.pred_history = collections.deque(maxlen=SMOOTH_WINDOW_DEFAULT)
-        # Runtime settings modified safely by user interface sliders
         self.alert_frames_val = ALERT_FRAMES_DEFAULT
         self.conf_thresh_val = CONF_THRESH_DEFAULT
 
@@ -218,7 +217,6 @@ def log_event(msg, kind="ok"):
     if len(st.session_state["event_log"]) > 30:
         st.session_state["event_log"].pop()
 
-# Base system status logging setup
 if not st.session_state["event_log"]:
     if SHARED_MODEL is not None:
         log_event("EfficientNetB0 model loaded ✓", "ok")
@@ -239,14 +237,14 @@ def run_model_inference(frame_rgb):
         return np.array([p_drowsy, 1 - p_drowsy])
 
 # ─────────────────────────────────────────────────────────────
-# WebRTC Isolated Engine Video Callback Processing Loop
+# WebRTC Video Callback Processing Loop
 # ─────────────────────────────────────────────────────────────
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img_bgr = frame.to_ndarray(format="bgr24")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     t0 = time.time()
 
-    # ── Safe Inference Calculation ──
+    # Inference Calculation Pipeline
     raw_probs = run_model_inference(img_rgb)
     
     with MEMORY_BRIDGE.lock:
@@ -263,7 +261,7 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             label = MEMORY_BRIDGE.state_label if MEMORY_BRIDGE.state_label != "—" else "Non Drowsy"
             conf = max(smooth_probs)
 
-        # Sequential streak rules processing
+        # Sequential streak processing
         if label == "Drowsy":
             MEMORY_BRIDGE.drowsy_streak += 1
         else:
@@ -280,7 +278,6 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
 
         current_fps = max(1, int(1.0 / max(time.time() - t0, 0.001)))
         
-        # Save structural parameter data back into global shared class attributes
         MEMORY_BRIDGE.alert = alert
         MEMORY_BRIDGE.state_label = label
         MEMORY_BRIDGE.confidence = conf
@@ -333,7 +330,6 @@ with st.sidebar:
     smooth_win = st.slider("Temporal smoothing window", 1, 15, SMOOTH_WINDOW_DEFAULT,
                             help="Average N frames — reduces jitter")
 
-    # Safely modify configuration variables via global object attributes
     with MEMORY_BRIDGE.lock:
         MEMORY_BRIDGE.alert_frames_val = alert_frames
         MEMORY_BRIDGE.conf_thresh_val = conf_thresh
@@ -376,7 +372,6 @@ col_cam, col_panel = st.columns([5, 3], gap="large")
 with col_cam:
     banner_ph = st.empty()
     
-    # Cloud deployment configurations using standard public server nodes
     RTC_CONFIGURATION = RTCConfiguration(
         {"iceServers": [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]}
     )
@@ -422,7 +417,6 @@ with col_panel:
 # Primary Thread Panel UI Renderer Engine
 # ─────────────────────────────────────────────────────────────
 def render_panel_ui():
-    # Safely fetch current snapshot metrics from memory using thread lock bounds
     with MEMORY_BRIDGE.lock:
         label = MEMORY_BRIDGE.state_label
         conf  = MEMORY_BRIDGE.confidence
@@ -495,7 +489,13 @@ def render_panel_ui():
 # Paint metric changes dynamically onto the dashboard
 render_panel_ui()
 
-# Fast reactive interface refresh when the connection pipeline is active
+# Use an elegant browser-side periodic injection rather than server st.rerun calls
 if ctx.state.playing:
-    time.sleep(0.05)
-    st.rerun()
+    st.components.v1.html(
+        """
+        <script>
+            parent.window.document.dispatchEvent(new Event("DOMContentLoaded"));
+        </script>
+        """,
+        height=0,
+    )
