@@ -153,7 +153,7 @@ div[data-testid="stToolbar"] { visibility:hidden; }
 # ─────────────────────────────────────────────────────────────
 # Constants — matched EXACTLY to your notebook
 # ─────────────────────────────────────────────────────────────
-MODEL_PATH  = "model/efficientnet_drowsiness.h5"
+MODEL_PATH  = "driver_drowsiness_model.h5"
 IMG_SIZE    = (224, 224)          # your notebook Cell 2
 # Classes sorted alphabetically by image_dataset_from_directory
 # Kaggle dataset folders: 'Drowsy', 'Non Drowsy'  → [0, 1]
